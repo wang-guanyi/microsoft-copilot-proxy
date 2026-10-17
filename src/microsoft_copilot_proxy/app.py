@@ -8,7 +8,7 @@ from collections.abc import AsyncIterator, Callable
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from .config import Settings
+from .config import AVAILABLE_MODELS, Settings
 from .session_store import PersistentSession, PersistentSessionStore
 from .substrate_client import SubstrateCopilotClient, SubstrateCopilotError
 from .token_store import AccessTokenStore
@@ -17,6 +17,8 @@ from .translator import translate_anthropic_request, translate_openai_request, t
 
 _PERSIST_MODEL_SUFFIX = ":persist"
 _SESSION_ID_HEADER = "x-m365-session-id"
+_ANTHROPIC_MODEL_PREFIX = "claude-"
+_ANTHROPIC_DEFAULT_CONTEXT_WINDOW = 200_000
 
 
 def create_app(
@@ -29,7 +31,7 @@ def create_app(
     app.state.token_store = AccessTokenStore(resolved_settings.access_token)
     app.state.session_store = PersistentSessionStore()
     app.state.copilot_client_factory = copilot_client_factory or (
-        lambda: SubstrateCopilotClient(app.state.token_store.get(), resolved_settings.time_zone)
+        lambda: SubstrateCopilotClient(app.state.token_store.get())
     )
 
     def get_settings() -> Settings:
@@ -47,17 +49,8 @@ def create_app(
         return app.state.token_store.status()
 
     @app.get("/v1/models")
-    async def list_models(settings: Settings = Depends(get_settings)) -> dict:
-        return {
-            "object": "list",
-            "data": [
-                {
-                    "id": settings.model_alias,
-                    "object": "model",
-                    "owned_by": "microsoft-365-copilot",
-                }
-            ],
-        }
+    async def list_models() -> dict:
+        return _anthropic_models_response()
 
     @app.post("/v1/chat/completions")
     async def chat_completions(
@@ -76,11 +69,17 @@ def create_app(
                         client,
                         translated.prompt,
                         translated.additional_context,
+                        request.model,
                         session,
                     ),
                     media_type="text/event-stream",
                 )
-            text = await client.chat(translated.prompt, translated.additional_context, session)
+            text = await client.chat(
+                translated.prompt,
+                translated.additional_context,
+                request.model,
+                session,
+            )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except SubstrateCopilotError as exc:
@@ -116,12 +115,24 @@ def create_app(
 
         if request.stream:
             return StreamingResponse(
-                _responses_stream(settings.model_alias, client, translated.prompt, translated.additional_context, session),
+                _responses_stream(
+                    settings.model_alias,
+                    client,
+                    translated.prompt,
+                    translated.additional_context,
+                    request.model,
+                    session,
+                ),
                 media_type="text/event-stream",
             )
 
         try:
-            text = await client.chat(translated.prompt, translated.additional_context, session)
+            text = await client.chat(
+                translated.prompt,
+                translated.additional_context,
+                request.model,
+                session,
+            )
         except SubstrateCopilotError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
@@ -148,18 +159,31 @@ def create_app(
     ):
         try:
             translated = translate_anthropic_request(request)
-            session = _persistent_session(app, raw_request, request.model)
+            routed_model = _resolve_anthropic_model(request.model)
+            session = _persistent_session(app, raw_request, routed_model)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         if request.stream:
             return StreamingResponse(
-                _anthropic_stream(settings.model_alias, client, translated.prompt, translated.additional_context, session),
+                _anthropic_stream(
+                    settings.model_alias,
+                    client,
+                    translated.prompt,
+                    translated.additional_context,
+                    routed_model,
+                    session,
+                ),
                 media_type="text/event-stream",
             )
 
         try:
-            text = await client.chat(translated.prompt, translated.additional_context, session)
+            text = await client.chat(
+                translated.prompt,
+                translated.additional_context,
+                routed_model,
+                session,
+            )
         except SubstrateCopilotError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
@@ -177,18 +201,109 @@ def create_app(
     return app
 
 
+def _openai_models_response() -> dict:
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": model,
+                "object": "model",
+                "owned_by": "Microsoft_Copilot",
+            }
+            for model in AVAILABLE_MODELS
+        ],
+    }
+
+
+def _anthropic_models_response() -> dict:
+    data = [_anthropic_model(model) for model in AVAILABLE_MODELS]
+    return {
+        "data": data,
+        "first_id": data[0]["id"] if data else None,
+        "has_more": False,
+        "last_id": data[-1]["id"] if data else None,
+    }
+
+
+def _anthropic_model(model: str) -> dict:
+    public_id = model
+    return {
+        "id": public_id,
+        "type": "model",
+        "display_name": model,
+        "created_at": "1970-01-01T00:00:00Z",
+        "max_input_tokens": _ANTHROPIC_DEFAULT_CONTEXT_WINDOW,
+        "max_tokens": 0,
+        "capabilities": _anthropic_capabilities(),
+    }
+
+
+def _anthropic_capabilities() -> dict:
+    return {
+        "audio_input": {"supported": False},
+        "batch": {"supported": False},
+        "citations": {"supported": True},
+        "code_execution": {"supported": False},
+        "context_management": {
+            "clear_thinking_20251015": {"supported": True},
+            "clear_tool_uses_20250919": {"supported": True},
+            "compact_20260112": {"supported": False},
+            "max_input_tokens": _ANTHROPIC_DEFAULT_CONTEXT_WINDOW,
+            "supported": True,
+        },
+        "context_window": {
+            "max_input_tokens": _ANTHROPIC_DEFAULT_CONTEXT_WINDOW,
+            "one_million_context_variant": False,
+            "supported": True,
+            "supports_1m_context": False,
+        },
+        "effort": {
+            "high": {"supported": True},
+            "low": {"supported": True},
+            "max": {"supported": True},
+            "medium": {"supported": True},
+            "supported": True,
+            "ultra": {"supported": True},
+            "xhigh": {"supported": True},
+        },
+        "image_input": {"supported": False},
+        "pdf_input": {"supported": False},
+        "structured_outputs": {"supported": False},
+        "thinking": {
+            "supported": True,
+            "types": {
+                "adaptive": {"supported": True},
+                "enabled": {"supported": True},
+            },
+        },
+        "tool_use": {"supported": True},
+        "video_input": {"supported": False},
+    }
+
+
+def _resolve_anthropic_model(model: str) -> str:
+    normalized = model.strip()
+    if not normalized.lower().startswith(_ANTHROPIC_MODEL_PREFIX):
+        return model
+
+    candidate = normalized[len(_ANTHROPIC_MODEL_PREFIX):]
+    model_lookup = {available.lower(): available for available in AVAILABLE_MODELS}
+    return model_lookup.get(candidate.lower(), model)
+
+
 def _persistent_session(
     app: FastAPI,
     raw_request: Request,
     model: str,
     fallback_key: str | None = None,
 ) -> PersistentSession | None:
-    header_key = (raw_request.headers.get(_SESSION_ID_HEADER) or "").strip()
-    if header_key:
-        return app.state.session_store.get(f"header:{header_key}")
-    if model.endswith(_PERSIST_MODEL_SUFFIX):
-        return app.state.session_store.get(f"model:{fallback_key or 'default'}")
-    return None
+    header_key = (
+        raw_request.headers.get(_SESSION_ID_HEADER)
+        or fallback_key
+        or "default"
+    )
+
+    return app.state.session_store.get(header_key)
 
 
 async def _openai_stream(
@@ -196,6 +311,7 @@ async def _openai_stream(
     client: SubstrateCopilotClient,
     prompt: str,
     additional_context: list[str],
+    model: str,
     session: PersistentSession | None = None,
 ) -> AsyncIterator[str]:
     completion_id = f"chatcmpl_{uuid.uuid4().hex}"
@@ -209,7 +325,7 @@ async def _openai_stream(
     }
     yield f"data: {json.dumps(first_chunk)}\n\n"
     try:
-        async for delta in client.chat_stream(prompt, additional_context, session):
+        async for delta in client.chat_stream(prompt, additional_context, model, session):
             chunk = {
                 "id": completion_id,
                 "object": "chat.completion.chunk",
@@ -238,6 +354,7 @@ async def _responses_stream(
     client: SubstrateCopilotClient,
     prompt: str,
     additional_context: list[str],
+    model: str,
     session: PersistentSession | None = None,
 ) -> AsyncIterator[str]:
     resp_id = f"resp_{uuid.uuid4().hex}"
@@ -250,7 +367,7 @@ async def _responses_stream(
 
     full_text = ""
     try:
-        async for delta in client.chat_stream(prompt, additional_context, session):
+        async for delta in client.chat_stream(prompt, additional_context, model, session):
             full_text += delta
             yield f"data: {json.dumps({'type': 'response.output_text.delta', 'item_id': item_id, 'output_index': 0, 'content_index': 0, 'delta': delta})}\n\n"
     except SubstrateCopilotError as exc:
@@ -266,6 +383,7 @@ async def _anthropic_stream(
     client: SubstrateCopilotClient,
     prompt: str,
     additional_context: list[str],
+    model: str,
     session: PersistentSession | None = None,
 ) -> AsyncIterator[str]:
     msg_id = f"msg_{uuid.uuid4().hex}"
@@ -278,7 +396,7 @@ async def _anthropic_stream(
     yield sse("ping", {"type": "ping"})
 
     try:
-        async for delta in client.chat_stream(prompt, additional_context, session):
+        async for delta in client.chat_stream(prompt, additional_context, model, session):
             yield sse("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": delta}})
     except SubstrateCopilotError as exc:
         yield sse("error", {"type": "error", "error": {"type": "upstream_error", "message": str(exc)}})

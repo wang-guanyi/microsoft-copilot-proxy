@@ -3,6 +3,16 @@ from __future__ import annotations
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+AVAILABLE_MODELS = [
+    "Magic",
+    "Gpt_5_5_Chat",
+    "Gpt_5_4_Reasoning",
+    "Gpt_5_6_Chat",
+    "Gpt_5_6_Reasoning",
+    # "Claude_Sonnet",
+    # "Claude_Opus",
+]
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -12,5 +22,4 @@ class Settings(BaseSettings):
     )
 
     access_token: str = Field(default="", alias="M365_ACCESS_TOKEN")
-    time_zone: str = Field(default="Asia/Tokyo", alias="M365_TIME_ZONE")
-    model_alias: str = Field(default="m365-copilot", alias="M365_MODEL_ALIAS")
+    model_alias: str = Field(default="m365-copilot-auto", alias="M365_MODEL_ALIAS")

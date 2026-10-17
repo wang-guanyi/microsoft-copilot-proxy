@@ -32,7 +32,8 @@ class OpenAIChatRequest(BaseModel):
 class AnthropicMessage(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
-    role: Literal["user", "assistant"]
+    # Claude Code can send gateway-injected system messages in the messages array.
+    role: Literal["system", "user", "assistant"]
     content: str | list[ContentPart]
 
 
